@@ -30,8 +30,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY backend/ .
 
-# Copy built frontend from stage 1
-COPY --from=frontend-build /frontend/dist ./frontend_dist
+# 🔥 IMPORTANT FIX HERE
+COPY --from=frontend-build /frontend/dist ./frontend/dist
 
 RUN mkdir -p data/uploads/branding data/processed logs
 
