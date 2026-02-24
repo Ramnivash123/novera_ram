@@ -53,13 +53,13 @@ class User(Base):
         return f"<User(id={self.id}, email={self.email}, role={self.role})>"
 
     def is_admin(self):
-        return self.role in ["org_admin", "super_admin"]
+        return self.role in ["admin", "org_admin", "super_admin"]
     
     def is_super_admin(self):
         return self.role == "super_admin"
 
     def is_org_admin(self):
-        return self.role == "org_admin"
+        return self.role in ["admin", "org_admin"]
 
     def to_dict(self, include_sensitive: bool = False, include_organization: bool = True):
         """
