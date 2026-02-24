@@ -49,38 +49,41 @@ class EmbeddingService:
         
         logger.info(f"Embedding service initialized: Gemini {self.model_name} ({self.dimensions}D)")
     
-    def _init_local_model(self):
-        """Initialize local sentence-transformers model as fallback."""
-        if self.local_model is not None:
-            return
+def _init_local_model(self):
+    """Initialize local sentence-transformers model as fallback."""
+    if self.local_model is not None:
+        return
+    
+    try:
+        import torch
+        from sentence_transformers import SentenceTransformer
         
-        if not TORCH_AVAILABLE:
-            error_msg = (
-                "PyTorch/SentenceTransformers not available. "
-                "Cannot initialize local fallback model."
+        logger.info(f"PyTorch version: {torch.__version__}")
+        logger.info(f"CUDA available: {torch.cuda.is_available()}")
+        
+        # Verify _pytree availability
+        from torch.utils._pytree import register_pytree_node
+        logger.debug("✅ torch.utils._pytree.register_pytree_node available")
+        
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        logger.warning(f"Initializing local embedding model on {device}...")
+        
+        self.local_model = SentenceTransformer('all-mpnet-base-v2', device=device)
+        
+        # Validate
+        test_embedding = self.local_model.encode("test", convert_to_numpy=True)
+        logger.info(f"✅ Local model loaded successfully ({len(test_embedding)}D)")
+        
+    except AttributeError as e:
+        if "_pytree" in str(e):
+            logger.error(
+                f"PyTorch incomplete: {e}. "
+                "Ensure torch==2.1.2, torchvision==0.16.2, torchaudio==2.1.2 are installed."
             )
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
-        
-        try:
-            logger.info(f"PyTorch version: {torch.__version__}")
-            logger.info(f"CUDA available: {torch.cuda.is_available()}")
-            
-            # Select device
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            logger.warning(f"Initializing local embedding model on {device}...")
-            
-            # Initialize model with explicit device
-            model_name = 'all-mpnet-base-v2'
-            self.local_model = SentenceTransformer(model_name, device=device)
-            
-            # Validate model works
-            test_embedding = self.local_model.encode("test", convert_to_numpy=True)
-            logger.info(f"✅ Local model loaded successfully (device={device}, dims={len(test_embedding)})")
-            
-        except Exception as e:
-            logger.error(f"Failed to load local model: {str(e)}")
-            raise
+        raise
+    except Exception as e:
+        logger.error(f"Failed to load local model: {str(e)}")
+        raise
         
     async def generate_embedding(self, text: str) -> List[float]:
         """
