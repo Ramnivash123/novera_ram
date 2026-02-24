@@ -374,8 +374,10 @@ def _init_local_model(self):
             self._init_local_model()
             return await self._generate_embedding_local(enhanced_query)
 
-
 # Global instance
 embedding_service = EmbeddingService()
+
+# Verify embed_query exists
+logger.info(f"✅ EmbeddingService methods: {[m for m in dir(embedding_service) if not m.startswith('_')]}")
 
 __all__ = ['EmbeddingService', 'embedding_service']
