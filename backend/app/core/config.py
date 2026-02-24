@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     # Google Gemini Configuration
     gemini_api_key: Optional[str] = None
     gemini_embedding_model: str = "models/text-embedding-004"  
-    gemini_embedding_dimensions: int = 1536 
+    gemini_embedding_dimensions: int = 768 
     gemini_chat_model: str = "gemini-2.5-flash" 
     gemini_max_tokens: int = 8192
     
