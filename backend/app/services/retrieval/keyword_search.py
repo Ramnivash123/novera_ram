@@ -26,7 +26,10 @@ class KeywordSearchService:
             return metadata_obj
         if hasattr(metadata_obj, '__dict__'):
             try:
-                return {k: v for k, v in metadata_obj.__dict__.items() if not k.startswith('_')}
+                return {
+                    k: v for k, v in metadata_obj.__dict__.items()
+                    if not k.startswith('_')
+                }
             except Exception:
                 pass
         if hasattr(metadata_obj, 'keys') and hasattr(metadata_obj, '__getitem__'):
@@ -45,7 +48,11 @@ class KeywordSearchService:
         department: Optional[str] = None,
         document_filter: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
-        """Search chunks using keyword matching with optional document filtering."""
+        """
+        Search chunks using keyword matching with optional document filtering.
+        
+        FIXED: Added session rollback on error to prevent cascade failures.
+        """
         k = top_k or self.default_top_k
 
         try:
@@ -89,13 +96,19 @@ class KeywordSearchService:
             if document_filter:
                 filter_conditions = []
                 for i, doc_name in enumerate(document_filter):
-                    filter_conditions.append(f"d.filename ILIKE :doc_filter_{i}")
+                    filter_conditions.append(
+                        f"d.filename ILIKE :doc_filter_{i}"
+                    )
                     params[f"doc_filter_{i}"] = f"%{doc_name}%"
-                sql_parts.append(f"AND ({' OR '.join(filter_conditions)})")
-                logger.info(f"  Keyword search filtering to: {document_filter}")
+                sql_parts.append(
+                    f"AND ({' OR '.join(filter_conditions)})"
+                )
+                logger.info(
+                    f"  Keyword search filtering to: {document_filter}"
+                )
 
             sql_parts.append("ORDER BY rank DESC")
-            sql_parts.append(f"LIMIT :limit")
+            sql_parts.append("LIMIT :limit")
             params["limit"] = k
 
             full_sql = "\n".join(sql_parts)
@@ -105,7 +118,9 @@ class KeywordSearchService:
 
             chunks = []
             for row in rows:
-                chunk_metadata = self._safe_extract_metadata(row.chunk_metadata)
+                chunk_metadata = self._safe_extract_metadata(
+                    row.chunk_metadata
+                )
 
                 chunk_dict = {
                     'chunk_id': str(row.chunk_id),
@@ -129,11 +144,26 @@ class KeywordSearchService:
                 }
                 chunks.append(chunk_dict)
 
-            logger.info(f"Keyword search found {len(chunks)} matching chunks")
+            logger.info(
+                f"Keyword search found {len(chunks)} matching chunks"
+            )
             return chunks
 
         except Exception as e:
-            logger.error(f"Keyword search failed: {str(e)}", exc_info=True)
+            logger.error(f"Keyword search failed: {str(e)}")
+            # ============================================================
+            # FIX: Rollback session to prevent cascade failures
+            # ("current transaction is aborted" errors)
+            # ============================================================
+            try:
+                await db.rollback()
+                logger.info(
+                    "Session rolled back after keyword search error"
+                )
+            except Exception as rollback_err:
+                logger.error(
+                    f"Rollback also failed: {str(rollback_err)}"
+                )
             return []
 
     async def search_exact_phrase(
@@ -166,12 +196,17 @@ class KeywordSearchService:
                 LIMIT :limit
             """
 
-            result = await db.execute(text(sql), {"phrase": f"%{phrase}%", "limit": k})
+            result = await db.execute(
+                text(sql),
+                {"phrase": f"%{phrase}%", "limit": k}
+            )
             rows = result.fetchall()
 
             chunks = []
             for row in rows:
-                chunk_metadata = self._safe_extract_metadata(row.chunk_metadata)
+                chunk_metadata = self._safe_extract_metadata(
+                    row.chunk_metadata
+                )
 
                 chunk_dict = {
                     'chunk_id': str(row.chunk_id),
@@ -193,11 +228,17 @@ class KeywordSearchService:
                 }
                 chunks.append(chunk_dict)
 
-            logger.info(f"Exact phrase search found {len(chunks)} chunks")
+            logger.info(
+                f"Exact phrase search found {len(chunks)} chunks"
+            )
             return chunks
 
         except Exception as e:
-            logger.error(f"Exact phrase search failed: {str(e)}", exc_info=True)
+            logger.error(f"Exact phrase search failed: {str(e)}")
+            try:
+                await db.rollback()
+            except Exception:
+                pass
             return []
 
     async def search_by_metadata(
@@ -229,11 +270,13 @@ class KeywordSearchService:
             params = {}
 
             for i, (key, value) in enumerate(metadata_filters.items()):
-                sql_parts.append(f"AND c.metadata->>:key_{i} = :val_{i}")
+                sql_parts.append(
+                    f"AND c.metadata->>:key_{i} = :val_{i}"
+                )
                 params[f"key_{i}"] = key
                 params[f"val_{i}"] = str(value)
 
-            sql_parts.append(f"LIMIT :limit")
+            sql_parts.append("LIMIT :limit")
             params["limit"] = k
 
             full_sql = "\n".join(sql_parts)
@@ -243,7 +286,9 @@ class KeywordSearchService:
 
             chunks = []
             for row in rows:
-                chunk_metadata = self._safe_extract_metadata(row.chunk_metadata)
+                chunk_metadata = self._safe_extract_metadata(
+                    row.chunk_metadata
+                )
 
                 chunk_dict = {
                     'chunk_id': str(row.chunk_id),
@@ -263,7 +308,11 @@ class KeywordSearchService:
             return chunks
 
         except Exception as e:
-            logger.error(f"Metadata search failed: {str(e)}", exc_info=True)
+            logger.error(f"Metadata search failed: {str(e)}")
+            try:
+                await db.rollback()
+            except Exception:
+                pass
             return []
 
 
