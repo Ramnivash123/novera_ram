@@ -47,7 +47,6 @@ logger.add(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    # Startup
     logger.info("🚀 Starting Novera AI Knowledge Assistant...")
     logger.info(f"Environment: {settings.environment}")
     logger.info(f"Debug mode: {settings.debug}")
@@ -57,6 +56,20 @@ async def lifespan(app: FastAPI):
         await init_db()
         logger.info("✅ Database initialized")
 
+        # Dimension check
+        try:
+            from sqlalchemy import text as sa_text
+            from app.db.session import AsyncSessionLocal
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    sa_text("SELECT array_length(embedding::real[], 1) as dim, COUNT(*) as count FROM chunks GROUP BY array_length(embedding::real[], 1)")
+                )
+                rows = result.fetchall()
+                for row in rows:
+                    logger.info(f"📐 EMBEDDING DIMENSIONS: {row.dim} dimensions, {row.count} chunks")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not check embedding dimensions: {e}")
+
         Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
         Path(settings.upload_dir + "/branding").mkdir(parents=True, exist_ok=True)
         logger.info("✅ Upload directories created")
@@ -64,11 +77,9 @@ async def lifespan(app: FastAPI):
         logger.info("📦 Pre-loading embedding model...")
         try:
             from app.services.embedding.embedding_service import embedding_service
-            embedding_service.use_local_fallback = True
-            embedding_service._init_local_model()
-            logger.info("✅ Embedding model pre-loaded")
+            logger.info(f"✅ Embedding service ready (local_fallback={embedding_service.use_local_fallback})")
         except Exception as e:
-            logger.warning(f"⚠️ Model pre-load failed: {e}")
+            logger.warning(f"⚠️ Embedding service check failed: {e}")
 
         logger.info("🎉 Application startup complete!")
 
@@ -78,7 +89,6 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown
     logger.info("🛑 Shutting down Novera AI Knowledge Assistant...")
     try:
         await close_db()
@@ -106,9 +116,9 @@ app = FastAPI(
 # RESOLVE FRONTEND PATH (works in Docker + Local)
 # ============================================
 _possible_frontend_paths = [
-    Path(__file__).resolve().parent.parent / "frontend" / "dist",   # /app/frontend/dist (Docker)
-    Path(__file__).resolve().parents[2] / "frontend" / "dist",      # Local dev (MENTANOVA/frontend/dist)
-    Path("/app/frontend/dist"),                                      # Absolute Docker path
+    Path(__file__).resolve().parent.parent / "frontend" / "dist",
+    Path(__file__).resolve().parents[2] / "frontend" / "dist",
+    Path("/app/frontend/dist"),
 ]
 
 frontend_path = None
@@ -118,7 +128,7 @@ for _path in _possible_frontend_paths:
         break
 
 if frontend_path is None:
-    frontend_path = _possible_frontend_paths[0]  # Default fallback
+    frontend_path = _possible_frontend_paths[0]
     logger.warning(f"⚠️ Frontend build not found. Tried: {[str(p) for p in _possible_frontend_paths]}")
 else:
     logger.info(f"✅ Frontend build found at: {frontend_path}")
@@ -238,21 +248,14 @@ print("==== END ROUTES ====\n")
 # ============================================
 @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 async def root_handler(request: Request):
-    """
-    Root endpoint:
-    - HEAD: Returns 200 for Render health checks
-    - GET: Serves frontend index.html if available, otherwise JSON health response
-    """
     if request.method == "HEAD":
         return JSONResponse({"status": "ok"})
 
-    # Try serving frontend
     if frontend_path and frontend_path.exists():
         index_file = frontend_path / "index.html"
         if index_file.exists():
             return FileResponse(index_file)
 
-    # No frontend? Return API health response
     return JSONResponse({
         "status": "healthy",
         "service": settings.app_name,
@@ -264,7 +267,6 @@ async def root_handler(request: Request):
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
-    """Serve favicon from frontend build."""
     if frontend_path and frontend_path.exists():
         favicon_file = frontend_path / "favicon.ico"
         if favicon_file.exists():
@@ -277,47 +279,29 @@ async def favicon():
 # ============================================
 @app.api_route("/{full_path:path}", methods=["GET"], include_in_schema=False)
 async def serve_spa_fallback(request: Request, full_path: str):
-    """
-    SPA fallback: serves index.html for all frontend routes.
-    
-    CRITICAL RULES:
-    1. This MUST be the last route registered
-    2. Only handles GET (so POST/PUT/DELETE to API routes work correctly)
-    3. Never intercepts /api/* or /uploads/* paths
-    """
-    # ---- NEVER intercept API routes ----
     if full_path.startswith("api"):
-        raise HTTPException(
-            status_code=404,
-            detail=f"API endpoint not found: /{full_path}"
-        )
+        raise HTTPException(status_code=404, detail=f"API endpoint not found: /{full_path}")
 
-    # ---- NEVER intercept upload routes ----
     if full_path.startswith("uploads"):
         raise HTTPException(status_code=404, detail="File not found")
 
-    # ---- NEVER intercept asset routes (handled by StaticFiles mount) ----
     if full_path.startswith("assets"):
         raise HTTPException(status_code=404, detail="Asset not found")
 
-    # ---- Try serving actual static file from frontend build ----
     if frontend_path and frontend_path.exists():
         static_file = frontend_path / full_path
         try:
-            # Security: prevent path traversal attacks
             static_file.resolve().relative_to(frontend_path.resolve())
             if static_file.exists() and static_file.is_file():
                 return FileResponse(static_file)
         except ValueError:
-            pass  # Path traversal attempt, ignore
+            pass
 
-    # ---- SPA: serve index.html for client-side routing ----
     if frontend_path and frontend_path.exists():
         index_file = frontend_path / "index.html"
         if index_file.exists():
             return FileResponse(index_file)
 
-    # ---- No frontend build available ----
     raise HTTPException(status_code=404, detail="Not Found")
 
 
@@ -331,90 +315,45 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    """Handle HTTP exceptions."""
     logger.warning(f"HTTP {exc.status_code} on {request.method} {request.url.path}: {exc.detail}")
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "error": exc.detail,
-            "message": exc.detail,
-            "status_code": exc.status_code
-        }
+        content={"error": exc.detail, "message": exc.detail, "status_code": exc.status_code}
     )
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Handle request validation errors."""
     logger.error(f"Validation error on {request.method} {request.url.path}: {exc.errors()}")
     return JSONResponse(
         status_code=422,
-        content={
-            "error": "Validation error",
-            "message": "Invalid request data",
-            "details": exc.errors() if settings.debug else None
-        }
+        content={"error": "Validation error", "message": "Invalid request data", "details": exc.errors() if settings.debug else None}
     )
 
 
 @app.exception_handler(IntegrityError)
 async def integrity_exception_handler(request: Request, exc: IntegrityError):
-    """Handle database integrity errors."""
     logger.error(f"Integrity error on {request.method} {request.url.path}: {str(exc)}")
     error_msg = str(exc.orig) if hasattr(exc, 'orig') else str(exc)
-
     if "duplicate key" in error_msg.lower() or "unique constraint" in error_msg.lower():
-        return JSONResponse(
-            status_code=409,
-            content={
-                "error": "Conflict",
-                "message": "A record with this information already exists",
-                "type": "IntegrityError"
-            }
-        )
-
-    return JSONResponse(
-        status_code=400,
-        content={
-            "error": "Invalid data",
-            "message": "The provided data violates database constraints",
-            "type": "IntegrityError"
-        }
-    )
+        return JSONResponse(status_code=409, content={"error": "Conflict", "message": "A record with this information already exists", "type": "IntegrityError"})
+    return JSONResponse(status_code=400, content={"error": "Invalid data", "message": "The provided data violates database constraints", "type": "IntegrityError"})
 
 
 @app.exception_handler(SQLAlchemyError)
 async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
-    """Handle SQLAlchemy database errors."""
     logger.error(f"Database error on {request.method} {request.url.path}: {str(exc)}")
     logger.exception("Database error details:", exc_info=exc)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "Database error",
-            "message": "A database error occurred" if not settings.debug else str(exc),
-            "type": "DatabaseError"
-        }
-    )
+    return JSONResponse(status_code=500, content={"error": "Database error", "message": "A database error occurred" if not settings.debug else str(exc), "type": "DatabaseError"})
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Catch all unhandled exceptions."""
     logger.error(f"Unhandled exception on {request.method} {request.url.path}")
     logger.error(f"Exception type: {type(exc).__name__}")
     logger.error(f"Exception message: {str(exc)}")
     logger.exception("Full traceback:", exc_info=exc)
-
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "Internal server error",
-            "message": str(exc) if settings.debug else "An unexpected error occurred",
-            "type": type(exc).__name__ if settings.debug else None,
-            "path": str(request.url.path)
-        }
-    )
+    return JSONResponse(status_code=500, content={"error": "Internal server error", "message": str(exc) if settings.debug else "An unexpected error occurred", "type": type(exc).__name__ if settings.debug else None, "path": str(request.url.path)})
 
 
 # ============================================
