@@ -30,7 +30,10 @@ class VectorSearchService:
             return metadata_obj
         if hasattr(metadata_obj, '__dict__'):
             try:
-                return {k: v for k, v in metadata_obj.__dict__.items() if not k.startswith('_')}
+                return {
+                    k: v for k, v in metadata_obj.__dict__.items()
+                    if not k.startswith('_')
+                }
             except Exception:
                 pass
         if hasattr(metadata_obj, 'keys') and hasattr(metadata_obj, '__getitem__'):
@@ -38,7 +41,9 @@ class VectorSearchService:
                 return {k: metadata_obj[k] for k in metadata_obj.keys()}
             except Exception:
                 pass
-        logger.warning(f"Could not extract metadata from {type(metadata_obj)}")
+        logger.warning(
+            f"Could not extract metadata from {type(metadata_obj)}"
+        )
         return {}
 
     async def search_similar_chunks(
@@ -51,18 +56,29 @@ class VectorSearchService:
         document_ids: Optional[List[UUID]] = None,
         document_filter: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
-        """Search for chunks similar to query embedding with document filtering."""
+        """
+        Search for chunks similar to query embedding with document filtering.
+        
+        FIXED: Uses CAST(:embedding AS vector) instead of :embedding::vector
+        to avoid asyncpg parameter parsing conflicts with PostgreSQL's :: cast syntax.
+        """
         k = top_k or self.top_k
 
-        logger.info(f"Vector search: top_k={k}, threshold={self.similarity_threshold}")
+        logger.info(
+            f"Vector search: top_k={k}, threshold={self.similarity_threshold}"
+        )
         logger.info(f"Query embedding dimensions: {len(query_embedding)}")
 
         try:
             # Convert embedding to string format for raw SQL
-            embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
+            embedding_str = (
+                "[" + ",".join(str(x) for x in query_embedding) + "]"
+            )
 
-            # Use raw SQL to avoid SQLAlchemy string formatting issues with pgvector
-            # This is the most reliable way to pass vector parameters
+            # ============================================================
+            # FIX: Use CAST(:param AS vector) instead of :param::vector
+            # The :: syntax conflicts with asyncpg's :param syntax
+            # ============================================================
             sql_parts = [
                 """
                 SELECT 
@@ -80,7 +96,7 @@ class VectorSearchService:
                     d.doc_type,
                     d.department,
                     d.metadata as doc_metadata,
-                    1 - (c.embedding <=> :embedding::vector) as similarity
+                    1 - (c.embedding <=> CAST(:embedding AS vector)) as similarity
                 FROM chunks c
                 JOIN documents d ON c.document_id = d.id
                 WHERE d.status = 'completed'
@@ -98,7 +114,9 @@ class VectorSearchService:
                 params["department"] = department
 
             if document_ids:
-                placeholders = ", ".join(f":doc_id_{i}" for i in range(len(document_ids)))
+                placeholders = ", ".join(
+                    f":doc_id_{i}" for i in range(len(document_ids))
+                )
                 sql_parts.append(f"AND d.id IN ({placeholders})")
                 for i, did in enumerate(document_ids):
                     params[f"doc_id_{i}"] = str(did)
@@ -106,15 +124,24 @@ class VectorSearchService:
             if document_filter:
                 filter_conditions = []
                 for i, doc_name in enumerate(document_filter):
-                    filter_conditions.append(f"d.filename ILIKE :doc_filter_{i}")
+                    filter_conditions.append(
+                        f"d.filename ILIKE :doc_filter_{i}"
+                    )
                     params[f"doc_filter_{i}"] = f"%{doc_name}%"
-                sql_parts.append(f"AND ({' OR '.join(filter_conditions)})")
-                logger.info(f"  Filtering to documents matching: {document_filter}")
+                sql_parts.append(
+                    f"AND ({' OR '.join(filter_conditions)})"
+                )
+                logger.info(
+                    f"  Filtering to documents matching: {document_filter}"
+                )
 
             sql_parts.append("ORDER BY similarity DESC")
             sql_parts.append(f"LIMIT {k * 2}")
 
             full_sql = "\n".join(sql_parts)
+
+            # Log the SQL for debugging (first time only)
+            logger.debug(f"Vector search SQL: {full_sql[:200]}...")
 
             # Execute raw query
             result = await db.execute(text(full_sql), params)
@@ -127,7 +154,9 @@ class VectorSearchService:
                 if similarity < self.similarity_threshold:
                     continue
 
-                chunk_metadata = self._safe_extract_metadata(row.chunk_metadata)
+                chunk_metadata = self._safe_extract_metadata(
+                    row.chunk_metadata
+                )
                 doc_metadata = self._safe_extract_metadata(row.doc_metadata)
 
                 chunk_dict = {
@@ -153,12 +182,26 @@ class VectorSearchService:
 
                 chunks.append(chunk_dict)
 
-            logger.info(f"Vector search found {len(chunks)} chunks above threshold {self.similarity_threshold}")
+            logger.info(
+                f"Vector search found {len(chunks)} chunks above "
+                f"threshold {self.similarity_threshold}"
+            )
 
             return chunks[:k]
 
         except Exception as e:
-            logger.error(f"Vector search failed: {str(e)}", exc_info=True)
+            logger.error(f"Vector search failed: {str(e)}")
+            # ============================================================
+            # FIX: Rollback the session so subsequent queries don't fail
+            # with "current transaction is aborted" error
+            # ============================================================
+            try:
+                await db.rollback()
+                logger.info("Session rolled back after vector search error")
+            except Exception as rollback_err:
+                logger.error(
+                    f"Rollback also failed: {str(rollback_err)}"
+                )
             return []
 
     async def search_by_document(
@@ -193,7 +236,9 @@ class VectorSearchService:
             row = result.first()
 
             if not row:
-                logger.warning(f"Chunk {chunk_id} not found for neighbor expansion")
+                logger.warning(
+                    f"Chunk {chunk_id} not found for neighbor expansion"
+                )
                 return []
 
             target_chunk, document = row
@@ -214,7 +259,9 @@ class VectorSearchService:
 
             neighbor_chunks = []
             for chunk in chunks:
-                chunk_metadata = self._safe_extract_metadata(chunk.chunk_metadata)
+                chunk_metadata = self._safe_extract_metadata(
+                    chunk.chunk_metadata
+                )
 
                 chunk_dict = {
                     'chunk_id': str(chunk.id),
@@ -239,7 +286,9 @@ class VectorSearchService:
             return neighbor_chunks
 
         except Exception as e:
-            logger.error(f"Failed to get chunk neighbors: {str(e)}", exc_info=True)
+            logger.error(
+                f"Failed to get chunk neighbors: {str(e)}"
+            )
             return []
 
 
