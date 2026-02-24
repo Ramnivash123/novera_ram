@@ -126,7 +126,7 @@ class Chunk(Base):
     title = Column(String(200), nullable=True, index=True)
 
     # Embedding vector
-    embedding = Column(Vector(1536), nullable=False)
+    embedding = Column(Vector(768), nullable=False)
 
     # JSONB chunk metadata
     chunk_metadata = Column("metadata", JSONB, nullable=False, default=dict)
