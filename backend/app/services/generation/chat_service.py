@@ -267,10 +267,9 @@ class ChatService:
             logger.info("🤖 RESPONSE SOURCE: CONVERSATIONAL")
         logger.info("=" * 60)
         
-        # Generate smart suggestions with full context
+         # Generate smart suggestions with full context
         suggestions = []
         try:
-            # Pass conversation history for better context
             history_for_suggestions = conversation_manager.get_history(conversation_id, limit=2) if conversation_id else []
             
             suggestions = await suggestion_service.generate_suggestions(
@@ -278,7 +277,7 @@ class ChatService:
                 last_response=answer,
                 context_summary=conv_context.get_context_summary(),
                 sources=sources,
-                conversation_history=history_for_suggestions  # ← NEW: Added conversation history
+                conversation_history=history_for_suggestions
             )
             
             # Filter by confidence if needed
@@ -293,20 +292,8 @@ class ChatService:
         except Exception as e:
             logger.error(f"Suggestion generation failed: {str(e)}", exc_info=True)
             suggestions = []
-            
-            # Filter by confidence if needed
-            if generation_result and generation_result.get('confidence') == 'low':
-                suggestions = suggestion_service.filter_suggestions_by_confidence(
-                    suggestions,
-                    'low'
-                )
-            
-            logger.info(f"Generated {len(suggestions)} smart suggestions: {suggestions}")
-        except Exception as e:
-            logger.error(f"Suggestion generation failed: {str(e)}", exc_info=True)
-            suggestions = []
         
-        # ✅ MUST be at top level, NOT in metadata
+        # ✅ MUST be at top level, NOT inside try block
         response_data = {
             'answer': answer,
             'conversation_id': conversation_id,
