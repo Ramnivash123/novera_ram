@@ -5,7 +5,7 @@ Implements cosine similarity search with filtering and ranking.
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, text
+from sqlalchemy import select, func, text, desc
 from loguru import logger
 
 from app.models.document import Chunk, Document
@@ -17,46 +17,32 @@ class VectorSearchService:
     Service for semantic similarity search using vector embeddings.
     Leverages pgvector's cosine similarity for efficient retrieval.
     """
-    
+
     def __init__(self):
         self.top_k = settings.retrieval_top_k
         self.similarity_threshold = settings.similarity_threshold
-    
+
     def _safe_extract_metadata(self, metadata_obj: Any) -> dict:
         """
         Safely extract metadata from SQLAlchemy object or dict.
-        
-        Args:
-            metadata_obj: Metadata object (could be dict, SQLAlchemy object, etc.)
-            
-        Returns:
-            Plain Python dictionary
         """
         if metadata_obj is None:
             return {}
-        
-        # If already a dict, return it
         if isinstance(metadata_obj, dict):
             return metadata_obj
-        
-        # If it has __dict__, try to extract
         if hasattr(metadata_obj, '__dict__'):
             try:
                 return {k: v for k, v in metadata_obj.__dict__.items() if not k.startswith('_')}
-            except:
+            except Exception:
                 pass
-        
-        # If it's mapping-like
         if hasattr(metadata_obj, 'keys') and hasattr(metadata_obj, '__getitem__'):
             try:
                 return {k: metadata_obj[k] for k in metadata_obj.keys()}
-            except:
+            except Exception:
                 pass
-        
-        # Fallback: empty dict
         logger.warning(f"Could not extract metadata from {type(metadata_obj)}")
         return {}
-    
+
     async def search_similar_chunks(
         self,
         query_embedding: List[float],
@@ -65,52 +51,44 @@ class VectorSearchService:
         doc_type: Optional[str] = None,
         department: Optional[str] = None,
         document_ids: Optional[List[UUID]] = None,
-        document_filter: Optional[List[str]] = None  # NEW: Filter by document names
+        document_filter: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
         """
         Search for chunks similar to query embedding with document filtering.
-        
-        Args:
-            query_embedding: Vector embedding of search query
-            db: Database session
-            top_k: Number of results (default from config)
-            doc_type: Filter by document type
-            department: Filter by department
-            document_ids: Filter by specific document IDs
-            document_filter: Filter by document names (NEW)
-            
-        Returns:
-            List of chunk dictionaries with similarity scores
         """
         k = top_k or self.top_k
-        
+
         logger.info(f"Vector search: top_k={k}, threshold={self.similarity_threshold}")
-        
+
         try:
+            # Build the similarity expression as a labeled column
+            similarity_expr = (
+                1 - Chunk.embedding.cosine_distance(query_embedding)
+            ).label('similarity')
+
             # Build the query with vector similarity
             query = (
                 select(
                     Chunk,
                     Document,
-                    (1 - Chunk.embedding.cosine_distance(query_embedding)).label('similarity')
+                    similarity_expr
                 )
                 .join(Document, Chunk.document_id == Document.id)
                 .where(Document.status == "completed")
             )
-            
+
             # Apply filters
             if doc_type:
                 query = query.where(Document.doc_type == doc_type)
-            
+
             if department:
                 query = query.where(Document.department == department)
-            
+
             if document_ids:
                 query = query.where(Document.id.in_(document_ids))
-            
-            # NEW: Filter by document names
+
+            # Filter by document names
             if document_filter:
-                # Use OR condition to match any of the document names
                 from sqlalchemy import or_
                 doc_conditions = [
                     Document.filename.ilike(f'%{doc_name}%')
@@ -118,27 +96,27 @@ class VectorSearchService:
                 ]
                 query = query.where(or_(*doc_conditions))
                 logger.info(f"  Filtering to documents matching: {document_filter}")
-            
-            # Order by similarity and limit
+
+            # FIXED: Use the column expression directly instead of text('similarity DESC')
             query = (
                 query
-                .order_by(text('similarity DESC'))
+                .order_by(desc(similarity_expr))
                 .limit(k * 2)
             )
-            
+
             # Execute query
             result = await db.execute(query)
             rows = result.all()
-            
+
             # Format results
             chunks = []
             for chunk, document, similarity in rows:
                 if similarity < self.similarity_threshold:
                     continue
-                
+
                 chunk_metadata = self._safe_extract_metadata(chunk.chunk_metadata)
                 doc_metadata = self._safe_extract_metadata(document.doc_metadata)
-                
+
                 chunk_dict = {
                     'chunk_id': str(chunk.id),
                     'id': str(chunk.id),
@@ -159,17 +137,17 @@ class VectorSearchService:
                         **chunk_metadata,
                     }
                 }
-                
+
                 chunks.append(chunk_dict)
-            
+
             logger.info(f"Vector search found {len(chunks)} chunks above threshold {self.similarity_threshold}")
-            
+
             return chunks[:k]
-            
+
         except Exception as e:
             logger.error(f"Vector search failed: {str(e)}", exc_info=True)
             return []
-    
+
     async def search_by_document(
         self,
         query_embedding: List[float],
@@ -179,7 +157,6 @@ class VectorSearchService:
     ) -> List[Dict[str, Any]]:
         """
         Search within a specific document only.
-        Useful for document-specific queries.
         """
         return await self.search_similar_chunks(
             query_embedding=query_embedding,
@@ -187,7 +164,7 @@ class VectorSearchService:
             top_k=top_k,
             document_ids=[document_id]
         )
-    
+
     async def get_chunk_neighbors(
         self,
         chunk_id: UUID,
@@ -197,33 +174,22 @@ class VectorSearchService:
     ) -> List[Dict[str, Any]]:
         """
         Get neighboring chunks for context expansion.
-        
-        Args:
-            chunk_id: Target chunk ID
-            db: Database session
-            n_before: Number of chunks before
-            n_after: Number of chunks after
-            
-        Returns:
-            List of neighboring chunks in order
         """
         try:
-            # Get target chunk
             result = await db.execute(
                 select(Chunk, Document)
                 .join(Document, Chunk.document_id == Document.id)
                 .where(Chunk.id == chunk_id)
             )
             row = result.first()
-            
+
             if not row:
                 logger.warning(f"Chunk {chunk_id} not found for neighbor expansion")
                 return []
-            
+
             target_chunk, document = row
             target_index = target_chunk.chunk_index
-            
-            # Get neighbors
+
             query = (
                 select(Chunk)
                 .where(
@@ -233,15 +199,14 @@ class VectorSearchService:
                 )
                 .order_by(Chunk.chunk_index)
             )
-            
+
             result = await db.execute(query)
             chunks = result.scalars().all()
-            
-            # Format results
+
             neighbor_chunks = []
             for chunk in chunks:
                 chunk_metadata = self._safe_extract_metadata(chunk.chunk_metadata)
-                
+
                 chunk_dict = {
                     'chunk_id': str(chunk.id),
                     'id': str(chunk.id),
@@ -261,9 +226,9 @@ class VectorSearchService:
                     }
                 }
                 neighbor_chunks.append(chunk_dict)
-            
+
             return neighbor_chunks
-            
+
         except Exception as e:
             logger.error(f"Failed to get chunk neighbors: {str(e)}", exc_info=True)
             return []
