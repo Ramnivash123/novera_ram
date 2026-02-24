@@ -5,10 +5,8 @@ Implements BM25-like ranking for exact match queries.
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, text, or_
+from sqlalchemy import text
 from loguru import logger
-
-from app.models.document import Chunk, Document
 
 
 class KeywordSearchService:
@@ -21,9 +19,7 @@ class KeywordSearchService:
         self.default_top_k = 10
 
     def _safe_extract_metadata(self, metadata_obj: Any) -> dict:
-        """
-        Safely extract metadata from SQLAlchemy object or dict.
-        """
+        """Safely extract metadata from any object type."""
         if metadata_obj is None:
             return {}
         if isinstance(metadata_obj, dict):
@@ -38,7 +34,6 @@ class KeywordSearchService:
                 return {k: metadata_obj[k] for k in metadata_obj.keys()}
             except Exception:
                 pass
-        logger.warning(f"Could not extract metadata from {type(metadata_obj)}")
         return {}
 
     async def search_keywords(
@@ -50,84 +45,91 @@ class KeywordSearchService:
         department: Optional[str] = None,
         document_filter: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Search chunks using keyword matching with optional document filtering.
-        """
+        """Search chunks using keyword matching with optional document filtering."""
         k = top_k or self.default_top_k
 
         try:
-            # Build query using PostgreSQL full-text search
-            query_stmt = (
-                select(
-                    Chunk,
-                    Document,
-                    func.ts_rank_cd(
-                        func.to_tsvector('english', Chunk.content),
-                        func.plainto_tsquery('english', query)
-                    ).label('rank')
-                )
-                .join(Document, Chunk.document_id == Document.id)
-                .where(
-                    Document.status == "completed",
-                    func.to_tsvector('english', Chunk.content).op('@@')(
-                        func.plainto_tsquery('english', query)
-                    )
-                )
-            )
+            sql_parts = [
+                """
+                SELECT 
+                    c.id as chunk_id,
+                    c.document_id,
+                    c.content,
+                    c.chunk_type,
+                    c.chunk_index,
+                    c.page_numbers,
+                    c.section_title,
+                    c.token_count,
+                    c.metadata as chunk_metadata,
+                    d.id as doc_id,
+                    d.filename,
+                    d.doc_type,
+                    d.department,
+                    ts_rank_cd(
+                        to_tsvector('english', c.content),
+                        plainto_tsquery('english', :query)
+                    ) as rank
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.id
+                WHERE d.status = 'completed'
+                AND to_tsvector('english', c.content) @@ plainto_tsquery('english', :query)
+                """
+            ]
 
-            # Apply filters
+            params = {"query": query}
+
             if doc_type:
-                query_stmt = query_stmt.where(Document.doc_type == doc_type)
+                sql_parts.append("AND d.doc_type = :doc_type")
+                params["doc_type"] = doc_type
 
             if department:
-                query_stmt = query_stmt.where(Document.department == department)
+                sql_parts.append("AND d.department = :department")
+                params["department"] = department
 
-            # Filter by document names
             if document_filter:
-                doc_conditions = [
-                    Document.filename.ilike(f'%{doc_name}%')
-                    for doc_name in document_filter
-                ]
-                query_stmt = query_stmt.where(or_(*doc_conditions))
+                filter_conditions = []
+                for i, doc_name in enumerate(document_filter):
+                    filter_conditions.append(f"d.filename ILIKE :doc_filter_{i}")
+                    params[f"doc_filter_{i}"] = f"%{doc_name}%"
+                sql_parts.append(f"AND ({' OR '.join(filter_conditions)})")
                 logger.info(f"  Keyword search filtering to: {document_filter}")
 
-            # Order by rank
-            query_stmt = query_stmt.order_by(text('rank DESC')).limit(k)
+            sql_parts.append("ORDER BY rank DESC")
+            sql_parts.append(f"LIMIT :limit")
+            params["limit"] = k
 
-            # Execute
-            result = await db.execute(query_stmt)
-            rows = result.all()
+            full_sql = "\n".join(sql_parts)
 
-            # Format results - FIXED: Safe metadata extraction
+            result = await db.execute(text(full_sql), params)
+            rows = result.fetchall()
+
             chunks = []
-            for chunk, document, rank in rows:
-                chunk_metadata = self._safe_extract_metadata(chunk.chunk_metadata)
+            for row in rows:
+                chunk_metadata = self._safe_extract_metadata(row.chunk_metadata)
 
                 chunk_dict = {
-                    'chunk_id': str(chunk.id),
-                    'id': str(chunk.id),
-                    'document_id': str(document.id),
-                    'document_name': document.filename,
-                    'content': chunk.content,
-                    'chunk_type': chunk.chunk_type,
-                    'chunk_index': chunk.chunk_index,
-                    'page_numbers': chunk.page_numbers,
-                    'section_title': chunk.section_title,
-                    'token_count': chunk.token_count,
-                    'keyword_score': float(rank),
+                    'chunk_id': str(row.chunk_id),
+                    'id': str(row.chunk_id),
+                    'document_id': str(row.doc_id),
+                    'document_name': row.filename,
+                    'content': row.content,
+                    'chunk_type': row.chunk_type,
+                    'chunk_index': row.chunk_index,
+                    'page_numbers': row.page_numbers,
+                    'section_title': row.section_title,
+                    'token_count': row.token_count,
+                    'keyword_score': float(row.rank),
                     'chunk_metadata': chunk_metadata,
                     'metadata': {
-                        'document_title': document.filename,
-                        'doc_type': document.doc_type,
-                        'department': document.department,
+                        'document_title': row.filename,
+                        'doc_type': row.doc_type,
+                        'department': row.department,
                         **chunk_metadata,
                     }
                 }
-
                 chunks.append(chunk_dict)
 
             logger.info(f"Keyword search found {len(chunks)} matching chunks")
-
             return chunks
 
         except Exception as e:
@@ -140,50 +142,58 @@ class KeywordSearchService:
         db: AsyncSession,
         top_k: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Search for exact phrase matches.
-        """
+        """Search for exact phrase matches."""
         k = top_k or self.default_top_k
 
         try:
-            query = (
-                select(Chunk, Document)
-                .join(Document, Chunk.document_id == Document.id)
-                .where(
-                    Document.status == "completed",
-                    Chunk.content.ilike(f'%{phrase}%')
-                )
-                .limit(k)
-            )
+            sql = """
+                SELECT 
+                    c.id as chunk_id,
+                    c.document_id,
+                    c.content,
+                    c.chunk_type,
+                    c.page_numbers,
+                    c.section_title,
+                    c.token_count,
+                    c.metadata as chunk_metadata,
+                    d.id as doc_id,
+                    d.filename,
+                    d.doc_type
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.id
+                WHERE d.status = 'completed'
+                AND c.content ILIKE :phrase
+                LIMIT :limit
+            """
 
-            result = await db.execute(query)
-            rows = result.all()
+            result = await db.execute(text(sql), {"phrase": f"%{phrase}%", "limit": k})
+            rows = result.fetchall()
 
             chunks = []
-            for chunk, document in rows:
-                chunk_metadata = self._safe_extract_metadata(chunk.chunk_metadata)
+            for row in rows:
+                chunk_metadata = self._safe_extract_metadata(row.chunk_metadata)
 
                 chunk_dict = {
-                    'chunk_id': str(chunk.id),
-                    'id': str(chunk.id),
-                    'document_id': str(document.id),
-                    'document_name': document.filename,
-                    'content': chunk.content,
-                    'chunk_type': chunk.chunk_type,
-                    'page_numbers': chunk.page_numbers,
-                    'section_title': chunk.section_title,
+                    'chunk_id': str(row.chunk_id),
+                    'id': str(row.chunk_id),
+                    'document_id': str(row.doc_id),
+                    'document_name': row.filename,
+                    'content': row.content,
+                    'chunk_type': row.chunk_type,
+                    'page_numbers': row.page_numbers,
+                    'section_title': row.section_title,
+                    'token_count': row.token_count,
                     'exact_match': True,
                     'chunk_metadata': chunk_metadata,
                     'metadata': {
-                        'document_title': document.filename,
-                        'doc_type': document.doc_type,
+                        'document_title': row.filename,
+                        'doc_type': row.doc_type,
                         **chunk_metadata,
                     }
                 }
                 chunks.append(chunk_dict)
 
             logger.info(f"Exact phrase search found {len(chunks)} chunks")
-
             return chunks
 
         except Exception as e:
@@ -196,42 +206,55 @@ class KeywordSearchService:
         db: AsyncSession,
         top_k: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Search chunks by metadata fields.
-        """
+        """Search chunks by metadata fields."""
         k = top_k or self.default_top_k
 
         try:
-            query = (
-                select(Chunk, Document)
-                .join(Document, Chunk.document_id == Document.id)
-                .where(Document.status == "completed")
-            )
+            sql_parts = [
+                """
+                SELECT 
+                    c.id as chunk_id,
+                    c.document_id,
+                    c.content,
+                    c.chunk_type,
+                    c.metadata as chunk_metadata,
+                    d.id as doc_id,
+                    d.filename
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.id
+                WHERE d.status = 'completed'
+                """
+            ]
 
-            for key, value in metadata_filters.items():
-                query = query.where(
-                    Chunk.chunk_metadata[key].astext == str(value)
-                )
+            params = {}
 
-            query = query.limit(k)
+            for i, (key, value) in enumerate(metadata_filters.items()):
+                sql_parts.append(f"AND c.metadata->>:key_{i} = :val_{i}")
+                params[f"key_{i}"] = key
+                params[f"val_{i}"] = str(value)
 
-            result = await db.execute(query)
-            rows = result.all()
+            sql_parts.append(f"LIMIT :limit")
+            params["limit"] = k
+
+            full_sql = "\n".join(sql_parts)
+
+            result = await db.execute(text(full_sql), params)
+            rows = result.fetchall()
 
             chunks = []
-            for chunk, document in rows:
-                chunk_metadata = self._safe_extract_metadata(chunk.chunk_metadata)
+            for row in rows:
+                chunk_metadata = self._safe_extract_metadata(row.chunk_metadata)
 
                 chunk_dict = {
-                    'chunk_id': str(chunk.id),
-                    'id': str(chunk.id),
-                    'document_id': str(document.id),
-                    'document_name': document.filename,
-                    'content': chunk.content,
-                    'chunk_type': chunk.chunk_type,
+                    'chunk_id': str(row.chunk_id),
+                    'id': str(row.chunk_id),
+                    'document_id': str(row.doc_id),
+                    'document_name': row.filename,
+                    'content': row.content,
+                    'chunk_type': row.chunk_type,
                     'chunk_metadata': chunk_metadata,
                     'metadata': {
-                        'document_title': document.filename,
+                        'document_title': row.filename,
                         **chunk_metadata,
                     }
                 }
