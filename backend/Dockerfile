@@ -9,7 +9,6 @@ RUN npm install
 COPY frontend/ .
 RUN npm run build
 
-
 # =========================
 # STAGE 2 — Backend
 # =========================
@@ -24,13 +23,21 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+# Prevent Python from writing .pyc files and enable unbuffered output
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ .
 
-# 🔥 IMPORTANT FIX HERE
+# Remove any __pycache__ that got copied from host
+RUN find /app -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+RUN find /app -name "*.pyc" -delete 2>/dev/null || true
+
+# Copy frontend build
 COPY --from=frontend-build /frontend/dist ./frontend/dist
 
 RUN mkdir -p data/uploads/branding data/processed logs
